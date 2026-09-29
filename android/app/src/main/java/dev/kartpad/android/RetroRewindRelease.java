@@ -1,0 +1,23 @@
+// Generated from builder/profiles/mkwii-rmcp01-rev0.json. Do not edit.
+package dev.kartpad.android;
+
+final class RetroRewindRelease {
+    private RetroRewindRelease() {}
+
+    static final String VERSION = "6.12.8";
+    static final String VERSION_MANIFEST_URL = "https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt";
+    static final String ROOT = "RetroRewind6";
+    static final String ARCHIVE_URL = "https://cdn.update.rwfc.net/RetroRewind/zip/6.12.8-full.zip";
+    static final String ARCHIVE_SHA256 = "9dc9f689b2d1bc03f7b9f49e9013f31d2ab31e9b800aa2da1f6badbd2ecf21dc";
+    static final String CODE_PUL_PATH = "Binaries/Code.pul";
+    static final String CODE_PUL_SHA256 = "88cd25ff08121f7c4ddb40538703f40c270f414f2dbc55a6b4b6767e62db7253";
+    static final String XML_PATH = "xml/RetroRewind6.xml";
+    static final String XML_SHA256 = "faf88234f81e16a85403d2a86d25e2ef4b261aedb553a312b532e60a11b28200";
+    static final String PAYLOAD_URL = "http://nas.play.rwfc.net/payload?g=RMCPD00";
+    static final String PAYLOAD_SHA256 = "099097a0f85a97c348123d91438438b24b112362f1fb23c94df6a343c5366471";
+    static final long ARCHIVE_BYTES = 1859035109L;
+    static final long MAXIMUM_EXPANDED_BYTES = 2200000000L;
+    static final long CODE_PUL_BYTES = 1704868L;
+    static final long XML_BYTES = 21047L;
+    static final long PAYLOAD_BYTES = 28992L;
+}

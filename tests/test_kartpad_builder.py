@@ -1,0 +1,450 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import plistlib
+import stat
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+from pathlib import Path
+
+from kartpad_builder.packaging import PackageError, audit_app, package_unsigned_ipa
+from kartpad_builder.android_release_contract import render_android_release_contract
+from kartpad_builder.pipeline import build, cache_key, dependency_cache_key
+from kartpad_builder.profiles import Profile, ProfileError, load_profiles, select_profile, validate_profile
+from kartpad_builder.release_header import render_retro_rewind_header
+from kartpad_builder.retro_rewind import (
+    _download,
+    BuildError,
+    extract_archive,
+    validate_pack,
+    validate_rwfc_payload,
+)
+
+
+REPO = Path(__file__).resolve().parents[1]
+PROFILES = REPO / "builder/profiles"
+
+
+class ProfileTests(unittest.TestCase):
+    def test_public_profiles_are_valid_and_unique(self) -> None:
+        profiles = load_profiles(PROFILES)
+        self.assertEqual([profile.id for profile in profiles], ["mkwii-rmcp01-rev0"])
+
+    def test_profile_can_accept_multiple_container_variants(self) -> None:
+        data = json.loads((PROFILES / "mkwii-rmcp01-rev0.json").read_text())
+        second_hash = "1" * 64
+        data["containers"]["acceptedImages"].append(
+            {"format": "iso", "sha256": second_hash, "note": "test variant"}
+        )
+        validate_profile(data)
+        profile = Profile(Path("test.json"), data)
+        self.assertIs(select_profile([profile], second_hash), profile)
+
+    def test_duplicate_container_hash_fails_closed(self) -> None:
+        data = json.loads((PROFILES / "mkwii-rmcp01-rev0.json").read_text())
+        data["containers"]["acceptedImages"].append(dict(data["containers"]["acceptedImages"][0]))
+        with self.assertRaisesRegex(ProfileError, "duplicate"):
+            validate_profile(data)
+
+    def test_unknown_image_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ProfileError, "no supported profile"):
+            select_profile(load_profiles(PROFILES), "0" * 64)
+
+    def test_other_dumps_are_provisional_until_extraction_verifies(self) -> None:
+        profiles = load_profiles(PROFILES)
+        self.assertTrue(profiles[0].accepts_verified_extraction)
+        self.assertIs(select_profile(profiles, "0" * 64, extension="rvz"), profiles[0])
+        with self.assertRaisesRegex(ProfileError, "no supported profile"):
+            select_profile(profiles, "0" * 64, extension="zip")
+        data = json.loads((PROFILES / "mkwii-rmcp01-rev0.json").read_text())
+        data["containers"]["acceptVerifiedExtraction"] = False
+        strict = Profile(Path("strict.json"), data)
+        with self.assertRaisesRegex(ProfileError, "no supported profile"):
+            select_profile([strict], "0" * 64, extension="iso")
+        data["containers"]["acceptVerifiedExtraction"] = "yes"
+        with self.assertRaisesRegex(ProfileError, "true or false"):
+            validate_profile(data)
+
+    def test_cache_key_changes_for_each_input(self) -> None:
+        profile = load_profiles(PROFILES)[0]
+        baseline = cache_key(profile, "a" * 64, "b" * 64)
+        self.assertNotEqual(baseline, cache_key(profile, "c" * 64, "b" * 64))
+        self.assertNotEqual(baseline, cache_key(profile, "a" * 64, "d" * 64))
+        changed = json.loads(json.dumps(profile.data))
+        changed["displayName"] += " changed"
+        self.assertNotEqual(baseline, cache_key(Profile(Path("changed"), changed), "a" * 64, "b" * 64))
+
+    def test_dependency_cache_key_changes_with_build_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "first").write_bytes(b"one")
+            (root / "second").write_bytes(b"two")
+            baseline = dependency_cache_key(root, ("first", "second"))
+            (root / "second").write_bytes(b"changed")
+            self.assertNotEqual(baseline, dependency_cache_key(root, ("first", "second")))
+
+    def test_dual_mode_upstream_contract_is_explicit(self) -> None:
+        profile = load_profiles(PROFILES)[0]
+        dependencies = {
+            dependency["name"]
+            for dependency in json.loads((REPO / "dependencies.lock.json").read_text())["dependencies"]
+        }
+        self.assertTrue(set(profile.data["sourceDependencies"]).issubset(dependencies))
+        self.assertIn("WiiCompiled", profile.data["sourceDependencies"])
+        self.assertIn("Retro Rewind Pulsar", profile.data["sourceDependencies"])
+        self.assertIn("Retro Rewind WFC patcher", profile.data["sourceDependencies"])
+
+    def test_release_header_is_generated_from_the_retro_rewind_pin(self) -> None:
+        profile = load_profiles(PROFILES)[0]
+        retro = profile.data["retroRewind"]
+        header = render_retro_rewind_header(profile.data)
+        self.assertIn(f'#define KARTPAD_RR_VERSION "{retro["version"]}"', header)
+        self.assertIn(
+            f'#define KARTPAD_RR_VERSION_MANIFEST_URL "{retro["versionManifestUrl"]}"',
+            header,
+        )
+        self.assertIn(f'#define KARTPAD_RR_ARCHIVE_URL "{retro["archive"]["url"]}"', header)
+        self.assertIn(retro["archive"]["sha256"], header)
+        self.assertIn(retro["codePul"]["sha256"], header)
+        self.assertIn(retro["riivolutionXml"]["sha256"], header)
+        self.assertIn(
+            f'/zip/{retro["version"]}-',
+            retro["archive"]["url"],
+            "the visible version and immutable archive URL must advance together",
+        )
+
+    def test_android_release_contract_matches_profile(self) -> None:
+        profile = load_profiles(PROFILES)[0]
+        expected = render_android_release_contract(profile.data)
+        generated = (
+            REPO
+            / "android/app/src/main/java/dev/kartpad/android/RetroRewindRelease.java"
+        ).read_text()
+        self.assertEqual(generated, expected)
+
+    def test_device_archive_hashing_uses_heap_storage(self) -> None:
+        source = (REPO / "apple/ios/KartPadRetroRewindInstaller.mm").read_text()
+        self.assertNotIn("uint8_t buffer[1024 * 1024]", source)
+        self.assertIn(
+            "NSMutableData *bufferStorage = [NSMutableData dataWithLength:1024 * 1024]",
+            source,
+        )
+
+    def test_retro_rewind_archive_path_policy_is_shared(self) -> None:
+        installer = (REPO / "apple/ios/KartPadRetroRewindInstaller.mm").read_text()
+        ios_source = (REPO / "vendor/runtimes/ios/runtime/cmake/PublicProducts.cmake").read_text()
+        tvos_source = (REPO / "vendor/runtimes/tvos/runtime/cmake/PublicProducts.cmake").read_text()
+        shared_sources = (
+            "runtime/src/retro_rewind/archive_path.cpp",
+            "runtime/src/retro_rewind/archive_scan.cpp",
+        )
+        self.assertIn('"kartpad/retro_rewind/archive_path.h"', installer)
+        self.assertIn('"kartpad/retro_rewind/archive_scan.h"', installer)
+        self.assertIn("ValidateArchiveMemberPath", installer)
+        self.assertIn("ArchiveScan", installer)
+        for shared_source in shared_sources:
+            self.assertIn(shared_source, ios_source)
+            self.assertIn(shared_source, tvos_source)
+
+    def test_version_watch_opens_one_actionable_issue(self) -> None:
+        workflow = (REPO / ".github/workflows/retro-rewind-version-watch.yml").read_text()
+        checker = (REPO / "scripts/check-retro-rewind-version.py").read_text()
+        updater = (REPO / "scripts/update-retro-rewind-profile.py").read_text()
+        self.assertIn("issues: write", workflow)
+        self.assertIn("gh issue create", workflow)
+        self.assertIn("update_required", workflow)
+        self.assertIn('parser.add_argument("--json"', checker)
+        self.assertIn("return 2 if update_required else 0", checker)
+        self.assertIn('"--latest"', updater)
+        self.assertIn("-full.zip", updater)
+
+    def test_newer_retro_rewind_message_explains_the_aot_boundary(self) -> None:
+        source = (REPO / "apple/ios/KartPadRuntimeOverlayHost.mm").read_text()
+        method = source.split(
+            "- (void)showKartPadUpdateRequiredForRetroVersion:", 1
+        )[1].split("- (void)checkRetroRewindVersionAndContinue", 1)[0]
+        self.assertIn("translate ahead of time", method)
+        self.assertIn("Original Mario Kart Wii remains available", method)
+        self.assertIn('actionWithTitle:@"View KartPad Releases"', method)
+
+    def test_dual_mode_chooser_keeps_a_width_on_wide_ipads(self) -> None:
+        source = (REPO / "apple/ios/KartPadRuntimeOverlayHost.mm").read_text()
+        self.assertIn("self.contentWidthConstraint.constant", source)
+        self.assertIn("CGRectGetWidth(self.view.bounds)", source)
+        self.assertNotIn("multiplier:0.72", source)
+
+    def test_multiplayer_guidance_keeps_a_visible_back_button_on_ipad(self) -> None:
+        source = (REPO / "apple/ios/KartPadRuntimeOverlayHost.mm").read_text()
+        method = source[source.index("- (void)showMultiplayerAccess") :]
+        method = method[: method.index("- (void)uninstall")]
+        self.assertIn("preferredStyle:UIAlertControllerStyleAlert", method)
+        self.assertIn('actionWithTitle:@"Back"', method)
+        self.assertNotIn("popoverPresentationController", method)
+
+
+class RetroRewindTests(unittest.TestCase):
+    def test_translator_accepts_current_kamek_v2_and_legacy_v3(self) -> None:
+        source = (REPO / "vendor/wiicompiled/translator/src/Translator.Core/Parsing/Kamek/KamekChunk.cs").read_text()
+        self.assertIn("Magic1V2 = 0x6B000002", source)
+        self.assertIn("Magic1 = 0x6B000003", source)
+        self.assertIn("Magic1V2 or Magic1", source)
+        self.assertIn("magic1 == Magic1V2", source)
+
+    def make_archive(self, root: Path, unsafe: bool = False) -> tuple[Path, dict]:
+        archive = root / "retro.zip"
+        code = b"code-pul-fixture"
+        xml = b"<riivolution/>\n"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("RetroRewind6/version.txt", "6.12.4\n")
+            bundle.writestr("RetroRewind6/Binaries/Code.pul", code)
+            bundle.writestr("RetroRewind6/xml/RetroRewind6.xml", xml)
+            bundle.writestr("apps/RetroRewind/boot.dol", b"not required by KartPad")
+            bundle.writestr("RetroRewind.wad", b"not required by KartPad")
+            if unsafe:
+                bundle.writestr("../escape", b"unsafe")
+        config = {
+            "version": "6.12.4",
+            "root": "RetroRewind6",
+            "archive": {
+                "url": "https://example.invalid/retro.zip",
+                "bytes": archive.stat().st_size,
+                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "maximumExpandedBytes": 1024 * 1024,
+            },
+            "codePul": {
+                "path": "Binaries/Code.pul",
+                "bytes": len(code),
+                "sha256": hashlib.sha256(code).hexdigest(),
+            },
+            "riivolutionXml": {
+                "path": "xml/RetroRewind6.xml",
+                "bytes": len(xml),
+                "sha256": hashlib.sha256(xml).hexdigest(),
+            },
+            "payload": {
+                "url": "http://example.invalid/payload",
+                "bytes": 1,
+                "sha256": "0" * 64,
+            },
+        }
+        return archive, config
+
+    def test_extracts_only_version_locked_retro_rewind_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive, config = self.make_archive(root)
+            destination = root / "RetroRewind6"
+            extract_archive(archive, destination, config)
+            validate_pack(destination, config)
+            self.assertFalse((root / "apps").exists())
+            self.assertFalse((root / "RetroRewind.wad").exists())
+
+    def test_archive_traversal_is_rejected_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive, config = self.make_archive(root, unsafe=True)
+            with self.assertRaisesRegex(Exception, "unsafe path"):
+                extract_archive(archive, root / "RetroRewind6", config)
+            self.assertFalse((root.parent / "escape").exists())
+
+    def test_pinned_download_preserves_cache_and_cleans_partial_on_rejection(self) -> None:
+        url = "http://example.invalid/payload"
+        accepted = b"new payload"
+        for case, body, returned_url, message in (
+            ("oversized", accepted + b"!", url, "larger than expected"),
+            ("short", accepted[:-1], url, "identity does not match"),
+            ("wrong hash", b"x" * len(accepted), url, "identity does not match"),
+            ("redirect", accepted, url + "/redirect", "redirected"),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "payload.bin"
+                output.write_bytes(b"previous verified payload")
+                response = io.BytesIO(body)
+                response.geturl = lambda: returned_url
+                with patch("urllib.request.urlopen", return_value=response):
+                    with self.assertRaisesRegex(BuildError, "Retro-WFC payload.*" + message):
+                        _download(url, output, len(accepted), hashlib.sha256(accepted).hexdigest(),
+                                  label="Retro-WFC payload")
+                self.assertEqual(output.read_bytes(), b"previous verified payload")
+                self.assertEqual(list(Path(temp).iterdir()), [output])
+
+    def test_pinned_download_replaces_cache_only_after_identity_matches(self) -> None:
+        url = "http://example.invalid/payload"
+        accepted = b"new payload"
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "payload.bin"
+            output.write_bytes(b"previous verified payload")
+            response = io.BytesIO(accepted)
+            response.geturl = lambda: url
+            with patch("urllib.request.urlopen", return_value=response):
+                _download(url, output, len(accepted), hashlib.sha256(accepted).hexdigest(),
+                          label="Retro-WFC payload")
+            self.assertEqual(output.read_bytes(), accepted)
+            self.assertEqual(list(Path(temp).iterdir()), [output])
+
+    def test_current_production_payload_signature_and_tamper_detection(self) -> None:
+        payload = REPO / "private/builder/retro-rewind-downloads/payload.RMCPD00.bin"
+        if not payload.is_file():
+            self.skipTest("private production payload is not cached")
+        config = load_profiles(PROFILES)[0].data["retroRewind"]["payload"]
+        validate_rwfc_payload(payload, config)
+        with tempfile.TemporaryDirectory() as temp:
+            tampered = Path(temp) / "payload.bin"
+            image = bytearray(payload.read_bytes())
+            image[-1] ^= 1
+            tampered.write_bytes(image)
+            changed = dict(config)
+            changed["sha256"] = hashlib.sha256(image).hexdigest()
+            with self.assertRaisesRegex(Exception, "signature"):
+                validate_rwfc_payload(tampered, changed)
+
+
+class PackagingTests(unittest.TestCase):
+    def make_app(self, root: Path) -> Path:
+        app = root / "KartPad.app"
+        app.mkdir()
+        plist = {
+            "CFBundleIdentifier": "dev.kartpad.app",
+            "CFBundleExecutable": "KartPad",
+        }
+        with (app / "Info.plist").open("wb") as handle:
+            plistlib.dump(plist, handle)
+        binary = app / "KartPad"
+        binary.write_bytes(b"test arm64 executable")
+        binary.chmod(0o755)
+        (app / "asset.bin").write_bytes(b"asset")
+        return app
+
+    def test_deterministic_unsigned_ipa(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = self.make_app(root)
+            first = root / "first.ipa"
+            second = root / "second.ipa"
+            provenance = {"schemaVersion": 1, "profileId": "test"}
+            first_hash = package_unsigned_ipa(app, first, provenance)
+            second_hash = package_unsigned_ipa(app, second, provenance)
+            self.assertEqual(first_hash, second_hash)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with zipfile.ZipFile(first) as archive:
+                mode = archive.getinfo("Payload/KartPad.app/KartPad").external_attr >> 16
+                self.assertTrue(mode & stat.S_IXUSR)
+
+    def test_ipa_is_stamped_with_the_shared_version(self) -> None:
+        from kartpad_builder.packaging import load_version
+        version = load_version(REPO)
+        self.assertRegex(version["version"], r"^\d+\.\d+\.\d+$")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = self.make_app(root)
+            output = root / "stamped.ipa"
+            package_unsigned_ipa(app, output, {"schemaVersion": 1}, None, version)
+            with zipfile.ZipFile(output) as archive:
+                plist = plistlib.loads(archive.read("Payload/KartPad.app/Info.plist"))
+            self.assertEqual(plist["CFBundleShortVersionString"], version["version"])
+            self.assertEqual(plist["CFBundleVersion"], str(version["build"]))
+            self.assertEqual(plist["CFBundleIdentifier"], "dev.kartpad.app")
+            # The source app is not modified.
+            with (app / "Info.plist").open("rb") as handle:
+                self.assertNotIn("CFBundleVersion", plistlib.load(handle))
+
+    def test_additional_public_release_entries_are_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = self.make_app(root)
+            first = root / "first.ipa"
+            second = root / "second.ipa"
+            provenance = {"schemaVersion": 1, "releaseTag": "v0.2.0-preview.2"}
+            entries = {
+                name: REPO / name
+                for name in ("LICENSE", "RIGHTS_AND_LICENSES.md", "THIRD_PARTY_NOTICES.md")
+            }
+            first_hash = package_unsigned_ipa(app, first, provenance, entries)
+            second_hash = package_unsigned_ipa(app, second, provenance, entries)
+            self.assertEqual(first_hash, second_hash)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with zipfile.ZipFile(first) as archive:
+                for name, source in entries.items():
+                    self.assertEqual(archive.read(name), source.read_bytes())
+                self.assertEqual(archive.read("LICENSE"), (REPO / "LICENSES/GPL-3.0.txt").read_bytes())
+
+    def test_personal_builder_packages_gpl_notices_and_scopes_game_rights(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = self.make_app(root)
+            # Reuse a synthetic app; this packaging check needs no game or network inputs.
+            with patch("kartpad_builder.pipeline.prepare_inputs") as prepare:
+                result = build(
+                    repo=REPO,
+                    profile=load_profiles(PROFILES)[0],
+                    image=root / "unused.wbfs",
+                    image_sha256="a" * 64,
+                    output=root / "personal.ipa",
+                    work_root=root / "work",
+                    app_override=app,
+                )
+            self.assertEqual(prepare.call_args.args[1], REPO / "private/builder")
+            with zipfile.ZipFile(result.ipa) as archive:
+                for name in ("LICENSE", "RIGHTS_AND_LICENSES.md", "THIRD_PARTY_NOTICES.md"):
+                    self.assertEqual(archive.read(name), (REPO / name).read_bytes())
+                provenance = json.loads(archive.read("KartPadBuilderProvenance.json"))
+                self.assertEqual(provenance["softwareLicense"], "GPL-3.0-only")
+                self.assertEqual(provenance["gameCodeRedistributionRights"], "not-cleared")
+                self.assertNotIn("redistributionAllowed", provenance)
+            events = [json.loads(line) for line in
+                      (root / "work/logs/progress.jsonl").read_text().splitlines()]
+            self.assertTrue(all(event["schema_version"] == 1 for event in events))
+            self.assertEqual([(event["event"], event["stage"]) for event in events], [
+                ("stage_started", "preflight"), ("stage_completed", "preflight"),
+                *[("stage_skipped", stage) for stage in
+                  ("extract", "translate", "dependencies", "generate", "compile")],
+                ("stage_started", "package"), ("stage_completed", "package")])
+
+    def test_unsafe_additional_entry_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = self.make_app(root)
+            notice = root / "notice"
+            notice.write_text("test\n")
+            with self.assertRaisesRegex(PackageError, "invalid additional"):
+                package_unsigned_ipa(
+                    app,
+                    root / "bad.ipa",
+                    {"schemaVersion": 1},
+                    {"../notice": notice},
+                )
+
+    def test_forbidden_game_image_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            app = self.make_app(Path(temp))
+            (app / "game.wbfs").write_bytes(b"private")
+            with self.assertRaisesRegex(PackageError, "forbidden"):
+                audit_app(app)
+
+    def test_private_build_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            app = self.make_app(Path(temp))
+            (app / "KartPad").write_bytes(b"prefix /Users/private/build suffix")
+            with self.assertRaisesRegex(PackageError, "private build path"):
+                audit_app(app, ("/Users/private",))
+
+
+class BootstrapTests(unittest.TestCase):
+    def test_interrupted_clone_reports_a_recoverable_error(self) -> None:
+        import subprocess
+        from kartpad_builder.bootstrap import _verify_checkout
+        from kartpad_builder.errors import BuildError
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root / "ref/upstream/partial")], check=True)
+            dependency = {"name": "partial", "path": "ref/upstream/partial", "commit": "0" * 40, "tree": "0" * 40}
+            with self.assertRaisesRegex(BuildError, "incomplete .*bootstrap again"):
+                _verify_checkout(root, dependency)
+
+
+if __name__ == "__main__":
+    unittest.main()

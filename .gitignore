@@ -1,0 +1,60 @@
+# macOS metadata
+.DS_Store
+
+# User-owned and private game data
+ref/*.iso
+ref/*.gcm
+ref/*.gcz
+ref/*.ciso
+ref/*.wbfs
+ref/*.wia
+ref/*.rvz
+private/
+generated/
+
+# Reference checkouts are pinned locally and described by lock files.
+ref/upstream/
+ref/sunpad/
+
+# Local build products and packages
+/build/
+build-*/
+**/bin/
+**/obj/
+DerivedData/
+/artifacts/
+/tmp/
+*.app
+*.ipa
+*.dSYM
+
+# Android machine-local state and build products
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+/android/**/build/
+/android/**/.cxx/
+/android/app/libs/*.aar
+!/android/app/libs/.gitkeep
+/.android-bootstrap/
+
+# Signing material, logs, saves, and captures
+*.mobileprovision
+*.p12
+*.jks
+*.keystore
+*.apk
+*.aab
+*.apks
+*.key
+*.pem
+*.log
+*.sav
+*.gci
+*.dtm
+*.pcap
+*.pcapng
+
+# Generated Python bytecode
+__pycache__/
+*.py[cod]
